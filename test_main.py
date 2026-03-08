@@ -8,6 +8,8 @@ import json
 import pathlib
 import datetime
 import base64
+import hmac
+import hashlib
 from typing import Dict, Optional
 
 # --- CRYPTOGRAPHY IMPORTS ---
@@ -265,6 +267,31 @@ class CloudStorageSync:
         self.key_status_var.set(f"Active Key: {preview} (Streaming AES-256)")
         self.key_status_label.config(foreground="green")
 
+    def encrypt_filename(self, path):
+        """Derive a deterministic, opaque blob name from the original path using HMAC-SHA256."""
+        h = hmac.new(self.encryption_key, path.encode('utf-8'), hashlib.sha256).hexdigest()
+        return f"enc_{h}"
+
+    def encrypt_metadata_path(self, path):
+        """Encrypt the original file path (AES-256-CBC) for storage in blob metadata."""
+        iv = secrets.token_bytes(16)
+        cipher = Cipher(algorithms.AES(self.encryption_key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        padder = padding.PKCS7(128).padder()
+        padded = padder.update(path.encode('utf-8')) + padder.finalize()
+        ciphertext = encryptor.update(padded) + encryptor.finalize()
+        return base64.urlsafe_b64encode(iv + ciphertext).decode()
+
+    def decrypt_metadata_path(self, encrypted_b64):
+        """Decrypt the original file path from blob metadata."""
+        data = base64.urlsafe_b64decode(encrypted_b64)
+        iv, ciphertext = data[:16], data[16:]
+        cipher = Cipher(algorithms.AES(self.encryption_key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        padded = decryptor.update(ciphertext) + decryptor.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')
+
     # --- MAIN LOGIC ---
 
     def browse_directory(self):
@@ -350,9 +377,20 @@ class CloudStorageSync:
             self.master.update_idletasks()
             self.cloud_files = {}
             for b in self.bucket.list_blobs():
-                if self.is_excluded(b.name): continue
                 is_enc = b.metadata and b.metadata.get('encryption') == 'aes-stream'
-                self.cloud_files[b.name] = {'size': b.size, 'modified': b.updated, 'is_encrypted': is_enc}
+                # Resolve original path: encrypted blobs store the original path in metadata
+                if is_enc and self.encryption_key and b.metadata.get('encrypted_path'):
+                    try:
+                        original_path = self.decrypt_metadata_path(b.metadata['encrypted_path'])
+                    except Exception:
+                        original_path = b.name  # fallback: cannot decrypt without matching key
+                else:
+                    original_path = b.name
+                if self.is_excluded(original_path): continue
+                self.cloud_files[original_path] = {
+                    'size': b.size, 'modified': b.updated,
+                    'is_encrypted': is_enc, 'blob_name': b.name
+                }
             
             self.master.after(0, self.update_file_list)
         except Exception as e:
@@ -504,7 +542,9 @@ class CloudStorageSync:
                 # --- UPLOAD ---
                 if fpath in self.local_files:
                     local_full = os.path.join(self.local_dir, fpath)
-                    blob = self.bucket.blob(fpath)
+                    # Use an encrypted blob name when a key is loaded
+                    blob_name = self.encrypt_filename(fpath) if self.encryption_key else fpath
+                    blob = self.bucket.blob(blob_name)
                     
                     if self.encryption_key:
                         self.status_var.set(f"Encrypting/Uploading {i+1}/{total}: {fpath}")
@@ -513,8 +553,11 @@ class CloudStorageSync:
                             with open(local_full, 'rb') as f:
                                 # Wrap file in encryption stream
                                 enc_stream = EncryptedStreamAdapter(f, self.encryption_key)
-                                # Set metadata
-                                blob.metadata = {'encryption': 'aes-stream'}
+                                # Store encrypted original path in metadata
+                                blob.metadata = {
+                                    'encryption': 'aes-stream',
+                                    'encrypted_path': self.encrypt_metadata_path(fpath)
+                                }
                                 # Upload via stream
                                 blob.upload_from_file(enc_stream, size=file_size + 16)
                         except Exception as e:
@@ -534,7 +577,8 @@ class CloudStorageSync:
                     local_full = os.path.join(self.local_dir, fpath)
                     os.makedirs(os.path.dirname(local_full), exist_ok=True)
                     
-                    blob = self.bucket.get_blob(fpath)
+                    blob_name = self.cloud_files[fpath].get('blob_name', fpath)
+                    blob = self.bucket.get_blob(blob_name)
                     is_enc = blob.metadata and blob.metadata.get('encryption') == 'aes-stream'
                     
                     if is_enc:
