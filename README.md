@@ -1,4 +1,4 @@
-# Secure Cloud Storage Sync
+# Encrypted Google Cloud Storage (GCS) Sync
 
 ![Status](https://img.shields.io/badge/Status-Vibe%20Coded-8A2BE2)
 ![Python](https://img.shields.io/badge/Python-3.x-blue)
