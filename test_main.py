@@ -165,23 +165,28 @@ class CloudStorageSync:
         files_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         self.tree = ttk.Treeview(files_frame)
-        self.tree["columns"] = ("status", "size", "last_modified", "encrypted")
+        self.tree["columns"] = ("status", "size", "last_modified", "encrypted", "cloud_name")
         self.tree.column("#0", width=300, minwidth=200)
         self.tree.column("status", width=100)
         self.tree.column("size", width=80)
         self.tree.column("last_modified", width=150)
         self.tree.column("encrypted", width=80)
+        self.tree.column("cloud_name", width=300, minwidth=200)
         
         self.tree.heading("#0", text="File Path")
         self.tree.heading("status", text="Status")
         self.tree.heading("size", text="Size")
         self.tree.heading("last_modified", text="Last Modified")
         self.tree.heading("encrypted", text="Encrypted?")
+        self.tree.heading("cloud_name", text="Cloud Name (Encrypted)")
         
         scrollbar = ttk.Scrollbar(files_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Bind Ctrl+C to copy cloud name
+        self.tree.bind("<Control-c>", self.copy_cloud_name)
         
         # --- Actions ---
         actions_frame = ttk.Frame(main_frame)
@@ -294,6 +299,20 @@ class CloudStorageSync:
 
     # --- MAIN LOGIC ---
 
+    def copy_cloud_name(self, event=None):
+        """Copy the encrypted cloud name to clipboard."""
+        sel = self.tree.selection()
+        if sel:
+            item = sel[0]
+            values = self.tree.item(item, "values")
+            if values and len(values) > 4:
+                cloud_name = values[4]
+                if cloud_name:
+                    self.master.clipboard_clear()
+                    self.master.clipboard_append(cloud_name)
+                    self.master.update()  # Required for clipboard to work
+                    self.status_var.set(f"Copied: {cloud_name}")
+    
     def browse_directory(self):
         d = filedialog.askdirectory()
         if d: self.local_dir_var.set(d); self.local_dir = d
@@ -408,9 +427,11 @@ class CloudStorageSync:
         dirs = {}
         for p in paths:
             enc_str = "No"
+            cloud_name = ""
             if p in self.local_files and p in self.cloud_files:
                 status = "Synced"
                 if self.cloud_files[p].get('is_encrypted'): enc_str = "Yes"
+                cloud_name = self.cloud_files[p].get('blob_name', p)
                 # Size check is tricky with encryption (overhead is just 16 bytes for IV)
                 ls, cs = self.local_files[p]['size'], self.cloud_files[p]['size']
                 if self.cloud_files[p].get('is_encrypted'):
@@ -423,6 +444,7 @@ class CloudStorageSync:
             else:
                 status = "Cloud only"
                 if self.cloud_files[p].get('is_encrypted'): enc_str = "Yes"
+                cloud_name = self.cloud_files[p].get('blob_name', p)
                 if self.sync_mode == "local_to_cloud": continue
             
             if p in self.local_files:
@@ -438,15 +460,15 @@ class CloudStorageSync:
             for i, part in enumerate(parts[:-1]):
                 if i==0:
                     curr = part
-                    if curr not in dirs: dirs[curr] = self.tree.insert("", "end", text=part, values=("","","",""))
+                    if curr not in dirs: dirs[curr] = self.tree.insert("", "end", text=part, values=("","","","",""))
                     parent = dirs[curr]
                 else:
                     parent_path = curr
                     curr = f"{curr}/{part}"
-                    if curr not in dirs: dirs[curr] = self.tree.insert(parent, "end", text=part, values=("","","",""))
+                    if curr not in dirs: dirs[curr] = self.tree.insert(parent, "end", text=part, values=("","","","",""))
                     parent = dirs[curr]
             
-            vals = (status, sz, mod, enc_str)
+            vals = (status, sz, mod, enc_str, cloud_name)
             if parts[:-1]: self.tree.insert(parent, "end", text=fname, values=vals)
             else: self.tree.insert("", "end", text=fname, values=vals)
             
