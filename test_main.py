@@ -89,7 +89,10 @@ class CloudStorageSync:
         # Encryption State
         self.encryption_key = None  # Raw bytes (32 bytes for AES-256)
         
+        self.config_file = "config.json"
+        
         self.create_ui()
+        self.load_config()
     
     def create_ui(self):
         main_frame = ttk.Frame(self.master, padding="10")
@@ -297,6 +300,30 @@ class CloudStorageSync:
         unpadder = padding.PKCS7(128).unpadder()
         return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')
 
+    def load_config(self):
+        """Load configuration from file."""
+        try:
+            with open(self.config_file, 'r') as f:
+                config = json.load(f)
+                self.local_dir = config.get('local_dir', '')
+                self.local_dir_var.set(self.local_dir)
+                self.credentials_path = config.get('credentials_path', '')
+                self.credentials_var.set(self.credentials_path)
+                self.bucket_name = config.get('bucket_name', '')
+                self.bucket_var.set(self.bucket_name)
+        except FileNotFoundError:
+            pass  # No config file yet
+
+    def save_config(self):
+        """Save current configuration to file."""
+        config = {
+            'local_dir': self.local_dir,
+            'credentials_path': self.credentials_path,
+            'bucket_name': self.bucket_name
+        }
+        with open(self.config_file, 'w') as f:
+            json.dump(config, f)
+
     # --- MAIN LOGIC ---
 
     def copy_cloud_name(self, event=None):
@@ -315,11 +342,17 @@ class CloudStorageSync:
     
     def browse_directory(self):
         d = filedialog.askdirectory()
-        if d: self.local_dir_var.set(d); self.local_dir = d
+        if d: 
+            self.local_dir_var.set(d)
+            self.local_dir = d
+            self.save_config()
     
     def browse_credentials(self):
         f = filedialog.askopenfilename(filetypes=[("JSON Files", "*.json")])
-        if f: self.credentials_var.set(f); self.credentials_path = f
+        if f: 
+            self.credentials_var.set(f)
+            self.credentials_path = f
+            self.save_config()
 
     def add_exclusion(self):
         p = simpledialog.askstring("Add Exclusion", "Pattern (e.g. 'temp', '.git')")
@@ -364,6 +397,7 @@ class CloudStorageSync:
                 messagebox.showinfo("Success", f"Connected to {self.bucket_name}")
                 self.sync_button.config(state=tk.NORMAL)
                 self.sync_all_button.config(state=tk.NORMAL)
+                self.save_config()
             except Exception as e:
                 messagebox.showerror("Error", f"Bucket error: {e}")
         except Exception as e:
@@ -472,6 +506,12 @@ class CloudStorageSync:
             if parts[:-1]: self.tree.insert(parent, "end", text=fname, values=vals)
             else: self.tree.insert("", "end", text=fname, values=vals)
             
+        # Update directory statuses
+        for dir_item in dirs.values():
+            status = self.get_directory_status(dir_item)
+            if status:
+                self.tree.set(dir_item, "status", status)
+        
         self.status_var.set(f"Local: {len(self.local_files)} | Cloud: {len(self.cloud_files)}")
 
     def format_size(self, b):
@@ -479,6 +519,24 @@ class CloudStorageSync:
             if b < 1024: return f"{b:.1f} {u}"
             b /= 1024
         return f"{b:.1f} TB"
+
+    def get_directory_status(self, item):
+        """Get the common status of all files in this directory (recursively), or empty if mixed."""
+        statuses = set()
+        for child in self.tree.get_children(item):
+            if self.tree.get_children(child):  # it's a subdirectory
+                sub_status = self.get_directory_status(child)
+                if sub_status:
+                    statuses.add(sub_status)
+                else:
+                    return ""  # mixed or empty
+            else:  # it's a file
+                status = self.tree.item(child, "values")[0]
+                if status:
+                    statuses.add(status)
+        if len(statuses) == 1:
+            return next(iter(statuses))
+        return ""
 
     def get_all_descendants(self, item):
         res = []
