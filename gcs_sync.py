@@ -12,13 +12,39 @@ except ImportError:
     simpledialog = None
 
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import pathlib
 import datetime
+import time
 import base64
 import hmac
 import hashlib
 from typing import Dict, Optional, Any
+
+# --- DURATION AND SPEED FORMATTING HELPERS ---
+def format_time_duration(seconds: float) -> str:
+    """Format duration in seconds into MM:SS or HH:MM:SS."""
+    if seconds is None or seconds < 0 or seconds == float('inf'):
+        return "--:--"
+    total_seconds = int(seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+def format_transfer_speed(bytes_per_sec: float) -> str:
+    """Format bytes per second into B/s, KB/s, or MB/s."""
+    if bytes_per_sec is None or bytes_per_sec <= 0:
+        return "0.0 B/s"
+    if bytes_per_sec < 1024:
+        return f"{bytes_per_sec:.1f} B/s"
+    elif bytes_per_sec < 1024 * 1024:
+        return f"{bytes_per_sec / 1024:.1f} KB/s"
+    else:
+        return f"{bytes_per_sec / (1024 * 1024):.2f} MB/s"
 
 # --- DEPENDENCY IMPORTS ---
 try:
@@ -41,17 +67,31 @@ except ImportError:
     padding = None
     import secrets
 
+class SyncPausedException(Exception):
+    """Raised when the user pauses sync, immediately aborting the active file transfer."""
+    pass
+
+
+class SyncCancelledException(Exception):
+    """Raised when the user cancels the entire sync operation."""
+    pass
+
+
 class EncryptedStreamAdapter:
     """
     A file-like object that encrypts data on the fly.
     Fixes the 'Content-Range' size mismatch error by reporting correct tell() offset.
     Appends a 16-byte random IV/nonce at the beginning of the stream.
+    Supports on_progress(bytes_count) callback for live upload speed tracking
+    and check_interrupted() callback to immediately abort in-flight transfer when paused.
     """
-    def __init__(self, source_file, key: bytes):
+    def __init__(self, source_file, key: bytes, on_progress=None, check_interrupted=None):
         if Cipher is None:
             raise RuntimeError("The 'cryptography' library is required for EncryptedStreamAdapter.")
         self.source_file = source_file
         self.key = key
+        self.on_progress = on_progress
+        self.check_interrupted = check_interrupted
         # Generate 16-byte IV (Nonce) for AES-CTR
         self.nonce = secrets.token_bytes(16)
         self.cipher = Cipher(algorithms.AES(key), modes.CTR(self.nonce), backend=default_backend())
@@ -59,6 +99,9 @@ class EncryptedStreamAdapter:
         self._nonce_sent = False
 
     def read(self, size=-1):
+        if self.check_interrupted:
+            self.check_interrupted()
+
         # If this is the very first read, prepare to send the Nonce
         chunk = b""
         if not self._nonce_sent:
@@ -71,6 +114,8 @@ class EncryptedStreamAdapter:
 
         # If size became 0 (or negative) after subtracting nonce, just return the nonce for now
         if size == 0:
+            if self.on_progress and chunk:
+                self.on_progress(len(chunk))
             return chunk
 
         # Read from the actual file
@@ -79,16 +124,45 @@ class EncryptedStreamAdapter:
 
         # If file is empty (EOF), just return whatever chunk we have (nonce or empty)
         if not data:
+            if self.on_progress and chunk:
+                self.on_progress(len(chunk))
             return chunk
 
         # Encrypt and append to our chunk (nonce + encrypted_data)
-        return chunk + self.encryptor.update(data)
+        encrypted_data = self.encryptor.update(data)
+        full_chunk = chunk + encrypted_data
+        if self.on_progress and full_chunk:
+            self.on_progress(len(full_chunk))
+        return full_chunk
 
     def tell(self):
         # CRITICAL FIX: Report the position of the *encrypted* stream (File + 16)
         # The GCS library uses this to verify upload integrity.
         offset = 16 if self._nonce_sent else 0
         return self.source_file.tell() + offset
+
+
+class ProgressStreamAdapter:
+    """
+    A file-like wrapper around a standard stream that triggers on_progress(bytes_count)
+    callback on every read for real-time transfer speed monitoring, and check_interrupted()
+    to immediately cancel in-flight transfer on pause.
+    """
+    def __init__(self, source_file, on_progress=None, check_interrupted=None):
+        self.source_file = source_file
+        self.on_progress = on_progress
+        self.check_interrupted = check_interrupted
+
+    def read(self, size=-1):
+        if self.check_interrupted:
+            self.check_interrupted()
+        data = self.source_file.read(size)
+        if data and self.on_progress:
+            self.on_progress(len(data))
+        return data
+
+    def tell(self):
+        return self.source_file.tell()
 
 
 class CloudStorageSync:
@@ -121,6 +195,16 @@ class CloudStorageSync:
         # Encryption State
         self.encryption_key: Optional[bytes] = None  # Raw 32 bytes for AES-256
 
+        # Sync Execution & Pause/Resume/Cancel Control State
+        self.is_syncing = False
+        self.is_paused = False
+        self.is_cancelled = False
+        self.pause_event = threading.Event()
+        self.pause_event.set()
+        self.current_syncing_file: Optional[str] = None
+        self.max_workers: int = 4
+        self.active_workers_count: int = 0
+
         # Caching State
         self.cloud_cache_timestamp: Optional[str] = None
         self.config_file = "config.json"
@@ -129,6 +213,24 @@ class CloudStorageSync:
         self.history_local_dirs: list[str] = []
         self.history_credentials_paths: list[str] = []
         self.history_bucket_names: list[str] = []
+
+        # Sorting and Filtering State across all columns
+        self.sort_column = "#0"
+        self.sort_descending = False
+        self.filter_status_var = tk.StringVar(value="All Statuses")
+        self.filter_encryption_var = tk.StringVar(value="All Encryption")
+        self.filter_search_var = tk.StringVar(value="")
+        self.view_mode_var = tk.StringVar(value="Tree View")
+        self._item_to_path = {}
+        self._item_to_raw_size = {}
+        self.tree_headings = {
+            "#0": "File Path",
+            "status": "Status",
+            "size": "Size",
+            "last_modified": "Last Modified",
+            "encrypted": "Encrypted?",
+            "cloud_name": "Cloud Name (Encrypted Blob)"
+        }
 
         self.create_ui()
         self.load_config()
@@ -157,8 +259,29 @@ class CloudStorageSync:
         main_frame = ttk.Frame(self.master, padding="12")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
+        # --- Configuration Container (Can be hidden/collapsed to enlarge files view) ---
+        self.config_hidden = False
+        self.config_container = ttk.Frame(main_frame)
+        self.config_container.pack(fill=tk.X, pady=2)
+
+        # Compact Summary Bar (Displayed when configuration is collapsed)
+        self.compact_config_bar = ttk.Frame(main_frame, padding="4")
+        self.compact_summary_var = tk.StringVar(value="")
+        self.compact_summary_label = ttk.Label(
+            self.compact_config_bar, 
+            textvariable=self.compact_summary_var, 
+            font=("TkDefaultFont", 9, "bold"), 
+            foreground="#0284c7"
+        )
+        self.compact_summary_label.pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            self.compact_config_bar, 
+            text="⚙️ Show Settings", 
+            command=self.toggle_config_visibility
+        ).pack(side=tk.RIGHT, padx=4)
+
         # --- Configuration ---
-        config_frame = ttk.LabelFrame(main_frame, text="Configuration & Path History", padding="10")
+        config_frame = ttk.LabelFrame(self.config_container, text="Configuration & Path History", padding="10")
         config_frame.pack(fill=tk.X, pady=4)
 
         # Local Dir (Editable Combobox with Dropdown History)
@@ -185,16 +308,23 @@ class CloudStorageSync:
         self.bucket_combo.bind("<<ComboboxSelected>>", self.on_bucket_selected)
         ttk.Button(config_frame, text="Connect", command=self.connect_to_gcs).grid(column=2, row=2, padx=5, pady=4)
 
-        # Sync Mode
+        # Sync Mode & Parallel Workers
         ttk.Label(config_frame, text="Sync Mode:").grid(column=0, row=3, sticky=tk.W, padx=5, pady=4)
-        self.sync_mode_var = tk.StringVar(value="two_way")
         sync_mode_frame = ttk.Frame(config_frame)
-        sync_mode_frame.grid(column=1, row=3, sticky=tk.W, padx=5, pady=4)
-        ttk.Radiobutton(sync_mode_frame, text="Two-way Sync", variable=self.sync_mode_var, value="two_way").pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(sync_mode_frame, text="Local to Cloud Only", variable=self.sync_mode_var, value="local_to_cloud").pack(side=tk.LEFT, padx=10)
+        sync_mode_frame.grid(column=1, row=3, columnspan=2, sticky=tk.W, padx=5, pady=4)
+        self.sync_mode_var = tk.StringVar(value="two_way")
+        ttk.Radiobutton(sync_mode_frame, text="Two-way Sync", variable=self.sync_mode_var, value="two_way").pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Radiobutton(sync_mode_frame, text="Local to Cloud Only", variable=self.sync_mode_var, value="local_to_cloud").pack(side=tk.LEFT, padx=(0, 20))
+
+        ttk.Label(sync_mode_frame, text="⚡ Parallel Transfers:").pack(side=tk.LEFT, padx=(10, 4))
+        self.workers_var = tk.IntVar(value=4)
+        self.workers_spinbox = ttk.Spinbox(sync_mode_frame, from_=1, to=16, width=4, textvariable=self.workers_var, command=self.on_workers_changed)
+        self.workers_spinbox.pack(side=tk.LEFT, padx=(0, 4))
+        self.workers_spinbox.bind("<KeyRelease>", lambda e: self.on_workers_changed())
+        ttk.Label(sync_mode_frame, text="threads (1-16)", foreground="#64748b").pack(side=tk.LEFT)
 
         # --- Encryption Section ---
-        enc_frame = ttk.LabelFrame(main_frame, text="Encryption Management (AES-256 CTR Streaming)", padding="10")
+        enc_frame = ttk.LabelFrame(self.config_container, text="Encryption Management (AES-256 CTR Streaming)", padding="10")
         enc_frame.pack(fill=tk.X, pady=4)
 
         ttk.Label(enc_frame, text="Current Key Status:").grid(column=0, row=0, sticky=tk.W, padx=5, pady=4)
@@ -211,7 +341,7 @@ class CloudStorageSync:
         ttk.Button(btn_frame, text="Unload Key", command=self.unload_key).pack(side=tk.LEFT, padx=4)
 
         # --- Cloud Cache Status & Control Bar ---
-        cache_frame = ttk.LabelFrame(main_frame, text="Cloud File Tree Cache", padding="8")
+        cache_frame = ttk.LabelFrame(self.config_container, text="Cloud File Tree Cache", padding="8")
         cache_frame.pack(fill=tk.X, pady=4)
 
         self.cache_status_var = tk.StringVar(value="Cloud Cache: No local cache stored yet")
@@ -229,7 +359,7 @@ class CloudStorageSync:
         self.clear_cache_btn.pack(side=tk.LEFT, padx=4)
 
         # --- Exclusions ---
-        exclusion_frame = ttk.LabelFrame(main_frame, text="Excluded Folders & Patterns", padding="8")
+        exclusion_frame = ttk.LabelFrame(self.config_container, text="Excluded Folders & Patterns", padding="8")
         exclusion_frame.pack(fill=tk.X, pady=4)
 
         self.exclusion_listbox = tk.Listbox(exclusion_frame, height=3)
@@ -246,11 +376,83 @@ class CloudStorageSync:
         ttk.Button(exclusion_buttons_frame, text="Save Exclusions", command=self.save_exclusions).pack(side=tk.LEFT, padx=4)
         ttk.Button(exclusion_buttons_frame, text="Load Exclusions", command=self.load_exclusions).pack(side=tk.LEFT, padx=4)
 
-        # --- File List Treeview ---
-        files_frame = ttk.LabelFrame(main_frame, text="Files", padding="8")
-        files_frame.pack(fill=tk.BOTH, expand=True, pady=4)
+        # --- File List Treeview with Sort & Filter Toolbar ---
+        self.files_frame = ttk.LabelFrame(main_frame, text="Files & Search Filters", padding="8")
+        self.files_frame.pack(fill=tk.BOTH, expand=True, pady=4)
 
-        self.tree = ttk.Treeview(files_frame)
+        # Filter & Search Toolbar
+        filter_toolbar = ttk.Frame(self.files_frame)
+        filter_toolbar.pack(fill=tk.X, pady=(0, 6))
+
+        # Search Query
+        ttk.Label(filter_toolbar, text="Search:").pack(side=tk.LEFT, padx=(0, 3))
+        self.search_entry = ttk.Entry(filter_toolbar, textvariable=self.filter_search_var, width=16)
+        self.search_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.search_entry.bind("<KeyRelease>", lambda e: self.update_file_list())
+
+        # Status Filter Combobox (including "Files in Cloud" / "Cloud only")
+        ttk.Label(filter_toolbar, text="Status:").pack(side=tk.LEFT, padx=(0, 3))
+        self.status_filter_combo = ttk.Combobox(
+            filter_toolbar,
+            textvariable=self.filter_status_var,
+            values=["All Statuses", "Files in Cloud", "Cloud only", "Local only", "Synced", "Modified"],
+            state="readonly",
+            width=13
+        )
+        self.status_filter_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.status_filter_combo.bind("<<ComboboxSelected>>", lambda e: self.update_file_list())
+
+        # Encryption Filter Combobox
+        ttk.Label(filter_toolbar, text="Encryption:").pack(side=tk.LEFT, padx=(0, 3))
+        self.enc_filter_combo = ttk.Combobox(
+            filter_toolbar,
+            textvariable=self.filter_encryption_var,
+            values=["All Encryption", "Encrypted only", "Unencrypted only"],
+            state="readonly",
+            width=15
+        )
+        self.enc_filter_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.enc_filter_combo.bind("<<ComboboxSelected>>", lambda e: self.update_file_list())
+
+        # View Mode Combobox (Tree vs Flat vs 2 Sides)
+        ttk.Label(filter_toolbar, text="View:").pack(side=tk.LEFT, padx=(0, 3))
+        self.view_mode_combo = ttk.Combobox(
+            filter_toolbar,
+            textvariable=self.view_mode_var,
+            values=["Tree View", "Flat View", "2 Sides View"],
+            state="readonly",
+            width=12
+        )
+        self.view_mode_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.view_mode_combo.bind("<<ComboboxSelected>>", lambda e: self.on_view_mode_changed())
+
+        # Quick Filter Action Buttons
+        ttk.Button(filter_toolbar, text="☁️ In Cloud", command=lambda: self.set_quick_status_filter("Files in Cloud")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(filter_toolbar, text="💻 Local Only", command=lambda: self.set_quick_status_filter("Local only")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(filter_toolbar, text="⚠️ Leaks", command=lambda: self.set_quick_encryption_filter("Unencrypted only")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(filter_toolbar, text="Reset", command=self.reset_filters).pack(side=tk.LEFT, padx=2)
+
+        # 2 Sides View Toggle Button (Local folder on left, Cloud bucket on right)
+        self.toggle_two_sided_btn = ttk.Button(
+            filter_toolbar,
+            text="👥 2 Sides View",
+            command=self.toggle_two_sided_view
+        )
+        self.toggle_two_sided_btn.pack(side=tk.RIGHT, padx=4)
+
+        # Enlarge Files View Toggle Button (Hides configuration sections above)
+        self.toggle_config_btn = ttk.Button(
+            filter_toolbar, 
+            text="🔍 Enlarge View", 
+            command=self.toggle_config_visibility
+        )
+        self.toggle_config_btn.pack(side=tk.RIGHT, padx=4)
+
+        # File Count Badge
+        self.filter_count_label = ttk.Label(filter_toolbar, text="", foreground="#475569")
+        self.filter_count_label.pack(side=tk.RIGHT, padx=4)
+
+        self.tree = ttk.Treeview(self.files_frame)
         self.tree["columns"] = ("status", "size", "last_modified", "encrypted", "cloud_name")
         self.tree.column("#0", width=300, minwidth=180)
         self.tree.column("status", width=110, minwidth=80)
@@ -259,14 +461,10 @@ class CloudStorageSync:
         self.tree.column("encrypted", width=80, minwidth=70)
         self.tree.column("cloud_name", width=280, minwidth=180)
 
-        self.tree.heading("#0", text="File Path")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("size", text="Size")
-        self.tree.heading("last_modified", text="Last Modified")
-        self.tree.heading("encrypted", text="Encrypted?")
-        self.tree.heading("cloud_name", text="Cloud Name (Encrypted Blob)")
+        for col_id, title in self.tree_headings.items():
+            self.tree.heading(col_id, text=title, command=lambda c=col_id: self.sort_by_column(c))
 
-        scrollbar = ttk.Scrollbar(files_frame, orient="vertical", command=self.tree.yview)
+        scrollbar = ttk.Scrollbar(self.files_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -277,6 +475,8 @@ class CloudStorageSync:
         self.tree.tag_configure("cloud_only", foreground="#7c3aed")     # Violet / Purple
         self.tree.tag_configure("modified", foreground="#d97706")       # Amber
         self.tree.tag_configure("unencrypted", foreground="#dc2626")    # Red Warning
+        self.tree.tag_configure("empty_local", foreground="#94a3b8")    # Muted Slate Gray for empty local row
+        self.tree.tag_configure("empty_cloud", foreground="#94a3b8")    # Muted Slate Gray for empty cloud row
 
         self.tree.bind("<Control-c>", self.copy_cloud_name)
 
@@ -298,13 +498,78 @@ class CloudStorageSync:
         self.sync_all_button.pack(side=tk.LEFT, padx=5)
         self.sync_all_button.config(state=tk.DISABLED)
 
+        self.pause_button = ttk.Button(actions_frame, text="⏸️ Pause Sync", command=self.toggle_pause_sync)
+        self.pause_button.pack(side=tk.LEFT, padx=5)
+        self.pause_button.config(state=tk.DISABLED)
+
+        self.cancel_button = ttk.Button(actions_frame, text="⏹️ Cancel Sync", command=self.cancel_sync)
+        self.cancel_button.pack(side=tk.LEFT, padx=5)
+        self.cancel_button.config(state=tk.DISABLED)
+
         # Status & Progress
         self.status_var = tk.StringVar(value="Ready. Connect to bucket or scan files to begin.")
         self.status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding="4")
-        self.status_bar.pack(fill=tk.X, pady=4)
+        self.status_bar.pack(fill=tk.X, pady=(4, 2))
+
+        # Transfer & Sync Telemetry (Speeds, Elapsed Time, ETA, Volume)
+        self.metrics_frame = ttk.Frame(main_frame)
+        self.metrics_frame.pack(fill=tk.X, pady=(1, 3))
+
+        self.speed_var = tk.StringVar(value="Speed: ↑ 0.0 KB/s  |  ↓ 0.0 KB/s")
+        self.speed_label = ttk.Label(self.metrics_frame, textvariable=self.speed_var, font=("TkDefaultFont", 9, "bold"), foreground="#0284c7")
+        self.speed_label.pack(side=tk.LEFT, padx=(4, 12))
+
+        self.time_var = tk.StringVar(value="Time: Elapsed: 00:00  |  ETA: --:--")
+        self.time_label = ttk.Label(self.metrics_frame, textvariable=self.time_var, font=("TkDefaultFont", 9), foreground="#334155")
+        self.time_label.pack(side=tk.LEFT, padx=(4, 12))
+
+        self.volume_var = tk.StringVar(value="Volume: 0 B / 0 B (0%)")
+        self.volume_label = ttk.Label(self.metrics_frame, textvariable=self.volume_var, font=("TkDefaultFont", 9), foreground="#475569")
+        self.volume_label.pack(side=tk.RIGHT, padx=4)
 
         self.progress = ttk.Progressbar(main_frame, orient=tk.HORIZONTAL, length=100, mode='determinate')
         self.progress.pack(fill=tk.X, pady=2)
+
+    def toggle_config_visibility(self):
+        """Toggle visibility of the configuration sections above the files list to enlarge treeview."""
+        self.config_hidden = not self.config_hidden
+        if self.config_hidden:
+            self.config_container.pack_forget()
+            key_str = "AES-256 CTR Key Active" if self.encryption_key else "No Key (Plaintext)"
+            b_str = f"gs://{self.bucket_name}" if self.bucket_name else "No bucket connected"
+            d_str = self.local_dir if self.local_dir else "No directory set"
+            self.compact_summary_var.set(f"📁 {d_str}   |   ☁️ {b_str}   |   🛡️ {key_str}")
+            self.compact_config_bar.pack(fill=tk.X, pady=2, before=self.files_frame)
+            if hasattr(self, 'toggle_config_btn'):
+                self.toggle_config_btn.config(text="⚙️ Show Settings")
+        else:
+            self.compact_config_bar.pack_forget()
+            self.config_container.pack(fill=tk.X, pady=2, before=self.files_frame)
+            if hasattr(self, 'toggle_config_btn'):
+                self.toggle_config_btn.config(text="🔍 Enlarge View")
+
+    def toggle_two_sided_view(self):
+        """Toggle between 2 Sides View (Left: Local, Right: Cloud) and standard Tree/Flat View."""
+        if self.view_mode_var.get() == "2 Sides View":
+            self.view_mode_var.set("Tree View")
+            if hasattr(self, 'toggle_two_sided_btn'):
+                self.toggle_two_sided_btn.config(text="👥 2 Sides View")
+        else:
+            self.view_mode_var.set("2 Sides View")
+            if hasattr(self, 'toggle_two_sided_btn'):
+                self.toggle_two_sided_btn.config(text="📋 Standard View")
+        self.update_heading_arrows()
+        self.update_file_list()
+
+    def on_view_mode_changed(self):
+        """Handle combobox view mode selection changes."""
+        if hasattr(self, 'toggle_two_sided_btn'):
+            if self.view_mode_var.get() == "2 Sides View":
+                self.toggle_two_sided_btn.config(text="📋 Standard View")
+            else:
+                self.toggle_two_sided_btn.config(text="👥 2 Sides View")
+        self.update_heading_arrows()
+        self.update_file_list()
 
     # --- CRYPTO HELPERS ---
 
@@ -764,6 +1029,16 @@ class CloudStorageSync:
             self.load_cloud_cache()
             self.save_config()
 
+    def on_workers_changed(self):
+        """Handle user changing worker thread count."""
+        try:
+            val = int(self.workers_var.get())
+            self.max_workers = max(1, min(16, val))
+            self.workers_var.set(self.max_workers)
+            self.save_config()
+        except Exception:
+            pass
+
     def load_config(self):
         """Load configuration and previous path history from file."""
         try:
@@ -775,6 +1050,15 @@ class CloudStorageSync:
                 self.credentials_var.set(self.credentials_path)
                 self.bucket_name = config.get('bucket_name', '')
                 self.bucket_var.set(self.bucket_name)
+
+                # Parallel worker threads count
+                saved_workers = config.get('max_workers', 4)
+                try:
+                    self.max_workers = max(1, min(16, int(saved_workers)))
+                    if hasattr(self, 'workers_var'):
+                        self.workers_var.set(self.max_workers)
+                except Exception:
+                    self.max_workers = 4
 
                 # Load previous history lists
                 self.history_local_dirs = config.get('history_local_dirs', [])
@@ -797,11 +1081,25 @@ class CloudStorageSync:
                 if hasattr(self, 'bucket_combo'):
                     self.bucket_combo['values'] = self.history_bucket_names
 
+                # Load excluded patterns
+                loaded_exclusions = config.get('excluded_patterns', None)
+                if loaded_exclusions is not None and isinstance(loaded_exclusions, list):
+                    self.excluded_patterns = loaded_exclusions
+
+                if hasattr(self, 'exclusion_listbox'):
+                    self.exclusion_listbox.delete(0, tk.END)
+                    for p in self.excluded_patterns:
+                        self.exclusion_listbox.insert(tk.END, p)
+
                 # Check for existing cache
                 if self.bucket_name:
                     self.load_cloud_cache()
         except FileNotFoundError:
-            pass
+            # If no previous config, populate listbox with defaults
+            if hasattr(self, 'exclusion_listbox'):
+                self.exclusion_listbox.delete(0, tk.END)
+                for p in self.excluded_patterns:
+                    self.exclusion_listbox.insert(tk.END, p)
 
     def save_config(self):
         """Save current configuration and history lists to file."""
@@ -838,9 +1136,11 @@ class CloudStorageSync:
             'local_dir': self.local_dir,
             'credentials_path': self.credentials_path,
             'bucket_name': self.bucket_name,
+            'max_workers': self.max_workers,
             'history_local_dirs': self.history_local_dirs,
             'history_credentials_paths': self.history_credentials_paths,
-            'history_bucket_names': self.history_bucket_names
+            'history_bucket_names': self.history_bucket_names,
+            'excluded_patterns': self.excluded_patterns
         }
         with open(self.config_file, 'w', encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -885,31 +1185,46 @@ class CloudStorageSync:
         p = simpledialog.askstring("Add Exclusion", "Pattern to ignore (e.g. '.git', '__pycache__', 'temp'):")
         if p and p.strip():
             p = p.strip()
-            self.excluded_patterns.append(p)
-            self.exclusion_listbox.insert(tk.END, p)
+            if p not in self.excluded_patterns:
+                self.excluded_patterns.append(p)
+                self.exclusion_listbox.insert(tk.END, p)
+                self.save_config()
+                self.status_var.set(f"Added exclusion '{p}' and saved to configuration.")
 
     def remove_exclusion(self):
         sel = self.exclusion_listbox.curselection()
         if sel:
             idx = sel[0]
-            self.excluded_patterns.pop(idx)
+            removed = self.excluded_patterns.pop(idx)
             self.exclusion_listbox.delete(idx)
+            self.save_config()
+            self.status_var.set(f"Removed exclusion '{removed}' and updated configuration.")
 
     def save_exclusions(self):
         f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
         if f:
             with open(f, 'w', encoding="utf-8") as fh:
-                json.dump(self.excluded_patterns, fh)
-            messagebox.showinfo("Saved", "Exclusion patterns saved.")
+                json.dump(self.excluded_patterns, fh, indent=2)
+            messagebox.showinfo("Saved", "Exclusion patterns saved to export file.")
 
     def load_exclusions(self):
         f = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
         if f:
-            with open(f, 'r', encoding="utf-8") as fh:
-                self.excluded_patterns = json.load(fh)
-                self.exclusion_listbox.delete(0, tk.END)
-                for p in self.excluded_patterns:
-                    self.exclusion_listbox.insert(tk.END, p)
+            try:
+                with open(f, 'r', encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                    if isinstance(loaded, list):
+                        self.excluded_patterns = loaded
+                        self.exclusion_listbox.delete(0, tk.END)
+                        for p in self.excluded_patterns:
+                            self.exclusion_listbox.insert(tk.END, p)
+                        self.save_config()
+                        self.status_var.set("Loaded exclusions from file and saved to configuration.")
+                        messagebox.showinfo("Loaded", f"Loaded {len(loaded)} exclusion patterns.")
+                    else:
+                        messagebox.showerror("Error", "Invalid exclusion file format (expected JSON list).")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load exclusions: {str(e)}")
 
     def is_excluded(self, path: str) -> bool:
         for p in self.excluded_patterns:
@@ -968,9 +1283,19 @@ class CloudStorageSync:
 
     def perform_scan(self, force_refresh_cloud: bool = False):
         try:
+            scan_start_time = time.time()
+            total_items_scanned = 0
+
             # 1. Scan Local Directory
             self.status_var.set("Scanning Local Directory...")
+            if hasattr(self, 'speed_var'):
+                self.speed_var.set("Speed: Structure Scan: Initializing...")
+            if hasattr(self, 'time_var'):
+                self.time_var.set("Time: Elapsed: 00:00  |  ETA: --:--")
+            if hasattr(self, 'volume_var'):
+                self.volume_var.set("Volume: 0 items discovered")
             self.master.update_idletasks()
+
             self.local_files = {}
             lp = pathlib.Path(self.local_dir)
             if lp.exists() and lp.is_dir():
@@ -984,6 +1309,17 @@ class CloudStorageSync:
                             'size': p.stat().st_size,
                             'modified': datetime.datetime.fromtimestamp(p.stat().st_mtime)
                         }
+                        total_items_scanned += 1
+                        if total_items_scanned % 15 == 0:
+                            elapsed = max(0.001, time.time() - scan_start_time)
+                            rate = total_items_scanned / elapsed
+                            if hasattr(self, 'speed_var'):
+                                self.speed_var.set(f"Speed: Structure Discovery: {rate:.1f} items/s")
+                            if hasattr(self, 'time_var'):
+                                self.time_var.set(f"Time: Elapsed: {format_time_duration(elapsed)}  |  ETA: --:--")
+                            if hasattr(self, 'volume_var'):
+                                self.volume_var.set(f"Volume: {len(self.local_files)} local files")
+                            self.master.update_idletasks()
 
             # 2. Scan Cloud (Check cache first unless force_refresh_cloud is True)
             has_cache = False
@@ -991,12 +1327,22 @@ class CloudStorageSync:
                 has_cache = self.load_cloud_cache()
 
             if has_cache and not force_refresh_cloud:
-                self.status_var.set(f"Loaded cloud files from cache ({len(self.cloud_files)} items)")
+                elapsed = max(0.001, time.time() - scan_start_time)
+                total_items = len(self.local_files) + len(self.cloud_files)
+                rate = total_items / elapsed
+                if hasattr(self, 'speed_var'):
+                    self.speed_var.set(f"Speed: Structure Cache: {rate:.1f} items/s (cached)")
+                if hasattr(self, 'time_var'):
+                    self.time_var.set(f"Time: Elapsed: {format_time_duration(elapsed)}  |  ETA: 00:00")
+                if hasattr(self, 'volume_var'):
+                    self.volume_var.set(f"Volume: {total_items} items")
+                self.status_var.set(f"Loaded cloud files from cache ({len(self.cloud_files)} items in {elapsed:.2f}s)")
             else:
                 self.status_var.set("Scanning Cloud Bucket (live query)...")
                 self.master.update_idletasks()
                 self.cloud_files = {}
 
+                cloud_count = 0
                 for b in self.bucket.list_blobs():
                     is_enc = b.metadata and b.metadata.get('encryption') == 'aes-stream'
                     # Resolve original path: encrypted blobs store the encrypted path in metadata
@@ -1017,9 +1363,31 @@ class CloudStorageSync:
                         'is_encrypted': is_enc,
                         'blob_name': b.name
                     }
+                    cloud_count += 1
+                    total_items_scanned += 1
+                    if cloud_count % 10 == 0:
+                        elapsed = max(0.001, time.time() - scan_start_time)
+                        rate = total_items_scanned / elapsed
+                        if hasattr(self, 'speed_var'):
+                            self.speed_var.set(f"Speed: Structure Discovery: {rate:.1f} items/s")
+                        if hasattr(self, 'time_var'):
+                            self.time_var.set(f"Time: Elapsed: {format_time_duration(elapsed)}  |  ETA: --:--")
+                        if hasattr(self, 'volume_var'):
+                            self.volume_var.set(f"Volume: {cloud_count} cloud blobs")
+                        self.master.update_idletasks()
 
                 # Save new cloud file tree to disk cache
                 self.save_cloud_cache()
+
+            total_elapsed = max(0.001, time.time() - scan_start_time)
+            total_items = len(self.local_files) + len(self.cloud_files)
+            overall_rate = total_items / total_elapsed
+            if hasattr(self, 'speed_var'):
+                self.speed_var.set(f"Speed: Structure: {overall_rate:.1f} items/s")
+            if hasattr(self, 'time_var'):
+                self.time_var.set(f"Time: Elapsed: {format_time_duration(total_elapsed)}  |  ETA: 00:00")
+            if hasattr(self, 'volume_var'):
+                self.volume_var.set(f"Volume: {total_items} items total")
 
             self.master.after(0, self.update_file_list)
         except Exception as e:
@@ -1027,26 +1395,86 @@ class CloudStorageSync:
         finally:
             self.is_scanning = False
 
-    def update_file_list(self):
-        self.tree.delete(*self.tree.get_children())
+    # --- SORTING AND FILTERING METHODS ---
+
+    def sort_by_column(self, col_id: str):
+        """Toggle sort order or switch sort column across all table columns."""
+        if self.sort_column == col_id:
+            self.sort_descending = not self.sort_descending
+        else:
+            self.sort_column = col_id
+            self.sort_descending = False
+        self.update_heading_arrows()
+        self.update_file_list()
+
+    def update_heading_arrows(self):
+        """Update treeview column headers with sort direction indicators."""
+        is_two_sided = self.view_mode_var.get() == "2 Sides View"
+        for col_id, base_title in self.tree_headings.items():
+            if is_two_sided:
+                if col_id == "#0":
+                    display_title = "Local File (Left Side)"
+                elif col_id == "status":
+                    display_title = "Sync State"
+                elif col_id == "size":
+                    display_title = "Local Size"
+                elif col_id == "last_modified":
+                    display_title = "Local Modified"
+                elif col_id == "encrypted":
+                    display_title = "Encrypted?"
+                elif col_id == "cloud_name":
+                    display_title = "Cloud Blob (Right Side)"
+                else:
+                    display_title = base_title
+            else:
+                display_title = base_title
+
+            if col_id == self.sort_column:
+                arrow = " ▼" if self.sort_descending else " ▲"
+                self.tree.heading(col_id, text=f"{display_title}{arrow}")
+            else:
+                self.tree.heading(col_id, text=display_title)
+
+    def set_quick_status_filter(self, status: str):
+        """Set a quick status filter like 'Files in Cloud' or 'Local only'."""
+        self.filter_status_var.set(status)
+        self.update_file_list()
+
+    def set_quick_encryption_filter(self, enc: str):
+        """Set a quick encryption filter like 'Unencrypted only'."""
+        self.filter_encryption_var.set(enc)
+        self.update_file_list()
+
+    def reset_filters(self):
+        """Reset all search filters to default."""
+        self.filter_status_var.set("All Statuses")
+        self.filter_encryption_var.set("All Encryption")
+        self.filter_search_var.set("")
+        self.update_file_list()
+
+    def collect_file_records(self) -> list:
+        """Collect normalized metadata for all files from local and cloud inventories."""
         if self.sync_mode == "local_to_cloud":
             paths = sorted(self.local_files.keys())
         else:
             paths = sorted(set(list(self.local_files.keys()) + list(self.cloud_files.keys())))
 
-        dirs = {}
+        records = []
         for p in paths:
             enc_str = "No"
+            is_enc = False
             cloud_name = ""
+            status = "Local only"
+
             if p in self.local_files and p in self.cloud_files:
                 status = "Synced"
                 if self.cloud_files[p].get('is_encrypted'):
                     enc_str = "Yes"
+                    is_enc = True
                 cloud_name = self.cloud_files[p].get('blob_name', p)
 
                 ls, cs = self.local_files[p]['size'], self.cloud_files[p]['size']
                 if self.cloud_files[p].get('is_encrypted'):
-                    # Encrypted file size has 16-byte nonce prepended
                     if cs != ls + 16:
                         status = "Modified"
                 else:
@@ -1058,52 +1486,224 @@ class CloudStorageSync:
                 status = "Cloud only"
                 if self.cloud_files[p].get('is_encrypted'):
                     enc_str = "Yes"
+                    is_enc = True
                 cloud_name = self.cloud_files[p].get('blob_name', p)
                 if self.sync_mode == "local_to_cloud":
                     continue
 
             if p in self.local_files:
-                sz = self.format_size(self.local_files[p]['size'])
-                mod = self.local_files[p]['modified'].strftime("%Y-%m-%d %H:%M")
+                raw_size = self.local_files[p]['size']
+                raw_mod = self.local_files[p]['modified']
+                mod_str = raw_mod.strftime("%Y-%m-%d %H:%M") if hasattr(raw_mod, 'strftime') else str(raw_mod)
             else:
-                sz = self.format_size(self.cloud_files[p]['size'])
-                cmod = self.cloud_files[p]['modified']
-                mod = cmod.strftime("%Y-%m-%d %H:%M") if isinstance(cmod, (datetime.datetime, datetime.date)) else str(cmod) if cmod else "?"
+                raw_size = self.cloud_files[p]['size']
+                raw_mod = self.cloud_files[p]['modified']
+                mod_str = raw_mod.strftime("%Y-%m-%d %H:%M") if hasattr(raw_mod, 'strftime') else str(raw_mod) if raw_mod else "?"
 
-            parts = p.split('/')
-            fname = parts[-1]
-            curr, parent = "", ""
-            for i, part in enumerate(parts[:-1]):
-                if i == 0:
-                    curr = part
-                    if curr not in dirs:
-                        dirs[curr] = self.tree.insert("", "end", text=part, values=("", "", "", "", ""))
-                    parent = dirs[curr]
+            records.append({
+                'path': p,
+                'status': status,
+                'raw_size': raw_size if raw_size is not None else 0,
+                'size_str': self.format_size(raw_size),
+                'raw_modified': raw_mod,
+                'mod_str': mod_str,
+                'encrypted': enc_str,
+                'is_encrypted': is_enc,
+                'cloud_name': cloud_name,
+                'in_cloud': p in self.cloud_files,
+                'in_local': p in self.local_files
+            })
+        return records
+
+    def filter_records(self, records: list) -> list:
+        """Filter records by status (e.g. only files on cloud), encryption, and text query."""
+        status_filter = self.filter_status_var.get()
+        enc_filter = self.filter_encryption_var.get()
+        search_query = self.filter_search_var.get().strip().lower()
+
+        filtered = []
+        for r in records:
+            # Status Filter
+            if status_filter == "Files in Cloud":
+                if not r['in_cloud']:
+                    continue
+            elif status_filter in ("Cloud only", "Local only", "Synced", "Modified"):
+                if r['status'] != status_filter:
+                    continue
+
+            # Encryption Filter
+            if enc_filter == "Encrypted only" and r['encrypted'] != "Yes":
+                continue
+            elif enc_filter == "Unencrypted only" and r['encrypted'] != "No":
+                continue
+
+            # Text Search Filter
+            if search_query:
+                fname = r['path'].split('/')[-1].lower()
+                full_path = r['path'].lower()
+                cname = r['cloud_name'].lower()
+                status_str = r['status'].lower()
+                if (search_query not in full_path and 
+                    search_query not in fname and 
+                    search_query not in cname and 
+                    search_query not in status_str):
+                    continue
+
+            filtered.append(r)
+        return filtered
+
+    def sort_records(self, records: list) -> list:
+        """Sort records by any column with support for numeric sizes and timestamps."""
+        col = self.sort_column
+        reverse = self.sort_descending
+
+        def sort_key(r):
+            if col == "#0":
+                return (r['path'].lower(),)
+            elif col == "status":
+                return (r['status'].lower(), r['path'].lower())
+            elif col == "size":
+                return (r['raw_size'], r['path'].lower())
+            elif col == "last_modified":
+                dt_str = str(r['raw_modified'] or "")
+                return (dt_str, r['path'].lower())
+            elif col == "encrypted":
+                return (r['encrypted'], r['path'].lower())
+            elif col == "cloud_name":
+                return (r['cloud_name'].lower(), r['path'].lower())
+            return (r['path'].lower(),)
+
+        return sorted(records, key=sort_key, reverse=reverse)
+
+    def update_file_list(self):
+        """Populate treeview with filtered and sorted file records."""
+        self.tree.delete(*self.tree.get_children())
+        self._item_to_path.clear()
+        self._item_to_raw_size.clear()
+
+        all_records = self.collect_file_records()
+        filtered_records = self.filter_records(all_records)
+        sorted_records = self.sort_records(filtered_records)
+
+        view_mode = self.view_mode_var.get()
+
+        if view_mode == "2 Sides View":
+            for r in sorted_records:
+                status = r['status']
+                # Left side (local file): empty placeholder if not on local disk
+                if not r['in_local']:
+                    local_text = "— (Empty on Local Disk) —"
+                    local_size = "—"
+                    local_mod = "—"
                 else:
-                    parent = dirs[curr]
-                    curr = f"{curr}/{part}"
-                    if curr not in dirs:
-                        dirs[curr] = self.tree.insert(parent, "end", text=part, values=("", "", "", "", ""))
-                    parent = dirs[curr]
+                    local_text = r['path']
+                    local_size = r['size_str']
+                    local_mod = r['mod_str']
 
-            vals = (status, sz, mod, enc_str, cloud_name)
-            tags = [status.lower().replace(" ", "_")]
-            if enc_str == "No":
-                tags.append("unencrypted")
+                # Right side (cloud file): empty placeholder if not in cloud bucket
+                if not r['in_cloud']:
+                    cloud_blob = "— (Empty in Cloud Storage) —"
+                    enc_display = "—"
+                else:
+                    cloud_blob = r['cloud_name'] or r['path']
+                    enc_display = "🔒 Yes (AES-256)" if r['encrypted'] == "Yes" else "⚠️ Plaintext"
 
-            if parts[:-1]:
-                self.tree.insert(parent, "end", text=fname, values=vals, tags=tuple(tags))
+                if status == "Local only":
+                    status_display = "Local only →"
+                elif status == "Cloud only":
+                    status_display = "← Cloud only"
+                elif status == "Synced":
+                    status_display = "🟢 Synced"
+                elif status == "Modified":
+                    status_display = "🟡 Modified"
+                else:
+                    status_display = status
+
+                vals = (status_display, local_size, local_mod, enc_display, cloud_blob)
+                tags = [status.lower().replace(" ", "_")]
+                if r['encrypted'] == "No" and r['in_cloud']:
+                    tags.append("unencrypted")
+                if not r['in_local']:
+                    tags.append("empty_local")
+                if not r['in_cloud']:
+                    tags.append("empty_cloud")
+
+                item_id = self.tree.insert("", "end", text=local_text, values=vals, tags=tuple(tags))
+                self._item_to_path[item_id] = r['path']
+                self._item_to_raw_size[item_id] = r.get('raw_size', 0)
+        elif view_mode == "Flat View":
+            for r in sorted_records:
+                vals = (r['status'], r['size_str'], r['mod_str'], r['encrypted'], r['cloud_name'])
+                tags = [r['status'].lower().replace(" ", "_")]
+                if r['encrypted'] == "No":
+                    tags.append("unencrypted")
+                item_id = self.tree.insert("", "end", text=r['path'], values=vals, tags=tuple(tags))
+                self._item_to_path[item_id] = r['path']
+                self._item_to_raw_size[item_id] = r.get('raw_size', 0)
+        else:
+            dirs = {}
+            for r in sorted_records:
+                p = r['path']
+                parts = p.split('/')
+                fname = parts[-1]
+                curr, parent = "", ""
+                for i, part in enumerate(parts[:-1]):
+                    if i == 0:
+                        curr = part
+                        if curr not in dirs:
+                            dirs[curr] = self.tree.insert("", "end", text=part, values=("", "", "", "", ""))
+                        parent = dirs[curr]
+                    else:
+                        parent = dirs[curr]
+                        curr = f"{curr}/{part}"
+                        if curr not in dirs:
+                            dirs[curr] = self.tree.insert(parent, "end", text=part, values=("", "", "", "", ""))
+                        parent = dirs[curr]
+
+                vals = (r['status'], r['size_str'], r['mod_str'], r['encrypted'], r['cloud_name'])
+                tags = [r['status'].lower().replace(" ", "_")]
+                if r['encrypted'] == "No":
+                    tags.append("unencrypted")
+
+                if parts[:-1]:
+                    item_id = self.tree.insert(parent, "end", text=fname, values=vals, tags=tuple(tags))
+                else:
+                    item_id = self.tree.insert("", "end", text=fname, values=vals, tags=tuple(tags))
+                self._item_to_path[item_id] = p
+                self._item_to_raw_size[item_id] = r.get('raw_size', 0)
+
+            # Compute cumulative folder sizes for files in them and all subfolders
+            dir_sizes = {}
+            for r in sorted_records:
+                p = r['path']
+                raw_sz = r.get('raw_size', 0)
+                parts = p.split('/')
+                curr = ""
+                for part in parts[:-1]:
+                    curr = f"{curr}/{part}" if curr else part
+                    dir_sizes[curr] = dir_sizes.get(curr, 0) + raw_sz
+
+            # Update directory cumulative size and aggregated statuses
+            for curr, dir_item in dirs.items():
+                self._item_to_path[dir_item] = curr
+                cum_size = dir_sizes.get(curr, 0)
+                self.tree.set(dir_item, "size", self.format_size(cum_size))
+                status = self.get_directory_status(dir_item)
+                if status:
+                    self.tree.set(dir_item, "status", status)
+
+        # Update filter count label and status bar
+        filter_status = self.filter_status_var.get()
+        if hasattr(self, 'filter_count_label'):
+            if len(sorted_records) != len(all_records):
+                self.filter_count_label.config(text=f"Showing {len(sorted_records)} of {len(all_records)} files (filtered)")
             else:
-                self.tree.insert("", "end", text=fname, values=vals, tags=tuple(tags))
-
-        # Update directory aggregated statuses
-        for dir_item in dirs.values():
-            status = self.get_directory_status(dir_item)
-            if status:
-                self.tree.set(dir_item, "status", status)
+                self.filter_count_label.config(text=f"Total: {len(all_records)} files")
 
         cache_note = " (cached)" if self.cloud_cache_timestamp else ""
-        self.status_var.set(f"Local: {len(self.local_files)} files | Cloud: {len(self.cloud_files)} files{cache_note}")
+        self.status_var.set(
+            f"Local: {len(self.local_files)} | Cloud: {len(self.cloud_files)}{cache_note} | Showing: {len(sorted_records)} files"
+        )
 
     def format_size(self, b):
         if b is None:
@@ -1132,6 +1732,16 @@ class CloudStorageSync:
             return next(iter(statuses))
         return ""
 
+    def get_directory_size(self, item) -> int:
+        """Get the cumulative size in bytes of all files in this directory and all subfolders."""
+        total = 0
+        for child in self.tree.get_children(item):
+            if self.tree.get_children(child):
+                total += self.get_directory_size(child)
+            else:
+                total += self._item_to_raw_size.get(child, 0)
+        return total
+
     def get_all_descendants(self, item):
         res = []
         for child in self.tree.get_children(item):
@@ -1143,6 +1753,9 @@ class CloudStorageSync:
         return res
 
     def get_path(self, item):
+        """Retrieve the canonical file path for a selected tree item."""
+        if hasattr(self, '_item_to_path') and item in self._item_to_path:
+            return self._item_to_path[item]
         parts = []
         cur = item
         while cur:
@@ -1213,7 +1826,41 @@ class CloudStorageSync:
 
         return True
 
-    # --- SYNC ACTIONS ---
+    # --- SYNC ACTIONS & PAUSE / RESUME / CANCEL CONTROLS ---
+
+    def toggle_pause_sync(self):
+        """Pause or resume the active synchronization."""
+        if not self.is_syncing:
+            return
+
+        if not self.is_paused:
+            # User wants to PAUSE
+            self.is_paused = True
+            self.pause_event.clear()
+            self.pause_button.config(text="▶️ Resume Sync")
+            workers_str = f" ({self.active_workers_count} active workers)" if self.active_workers_count > 0 else ""
+            self.status_var.set(f"⏸️ Pausing sync... cancelling in-flight file transfers{workers_str}. Press Resume to re-sync.")
+            if hasattr(self, 'speed_var'):
+                self.speed_var.set("Speed: ⏸️ PAUSED (0.0 KB/s)")
+        else:
+            # User wants to RESUME
+            self.is_paused = False
+            self.pause_event.set()
+            self.pause_button.config(text="⏸️ Pause Sync")
+            self.status_var.set(f"▶️ Resuming sync... continuing with {self.max_workers} worker threads.")
+
+    def cancel_sync(self):
+        """Cancel the ongoing sync entirely."""
+        if not self.is_syncing:
+            return
+        self.is_cancelled = True
+        self.is_paused = False
+        self.pause_event.set()  # Unblock if paused
+        self.status_var.set("⏹️ Cancelling sync operation...")
+        if hasattr(self, 'pause_button'):
+            self.pause_button.config(state=tk.DISABLED, text="⏸️ Pause Sync")
+        if hasattr(self, 'cancel_button'):
+            self.cancel_button.config(state=tk.DISABLED)
 
     def sync_selected_files(self):
         sel = self.tree.selection()
@@ -1280,118 +1927,339 @@ class CloudStorageSync:
         t.start()
 
     def perform_sync(self, file_list):
+        self.is_syncing = True
+        self.is_paused = False
+        self.is_cancelled = False
+        self.pause_event.set()
+        self.active_workers_count = 0
+
+        # Update GUI controls on main thread
+        self.master.after(0, lambda: [
+            self.pause_button.config(state=tk.NORMAL, text="⏸️ Pause Sync"),
+            self.cancel_button.config(state=tk.NORMAL),
+            self.sync_button.config(state=tk.DISABLED),
+            self.sync_all_button.config(state=tk.DISABLED),
+            self.scan_button.config(state=tk.DISABLED)
+        ])
+
+        def check_interrupted():
+            if self.is_cancelled:
+                raise SyncCancelledException("Sync operation was cancelled by user.")
+            if self.is_paused:
+                raise SyncPausedException("Sync operation was paused by user.")
+
         try:
             total = len(file_list)
-            self.progress['maximum'] = total
+            # Calculate total sync bytes across all targets
+            total_bytes = 0
+            for fpath in file_list:
+                if fpath in self.local_files:
+                    fsize = self.local_files[fpath].get('size', 0)
+                    total_bytes += fsize + (16 if self.encryption_key else 0)
+                elif fpath in self.cloud_files:
+                    total_bytes += self.cloud_files[fpath].get('size', 0)
+
+            sync_start_time = time.time()
+            transferred_bytes = 0
+            upload_bytes = 0
+            download_bytes = 0
+
+            # Locks for concurrency safety
+            progress_lock = threading.Lock()
+            state_lock = threading.Lock()
+
+            # Set of currently in-flight file paths across workers
+            active_inflight_files = set()
+
+            # Rolling window for responsive instantaneous upload/download speeds: (timestamp, bytes, is_upload)
+            transfer_history = []
+
+            self.progress['maximum'] = 100
             self.progress['value'] = 0
             cache_updated = False
+            completed_count = 0
 
-            for i, fpath in enumerate(file_list):
-                self.progress['value'] = i
-                self.master.update_idletasks()
+            def on_chunk_transferred(chunk_size: int, is_upload: bool):
+                nonlocal transferred_bytes, upload_bytes, download_bytes, transfer_history
+                now = time.time()
+                with progress_lock:
+                    transferred_bytes += chunk_size
+                    if is_upload:
+                        upload_bytes += chunk_size
+                    else:
+                        download_bytes += chunk_size
 
-                # --- UPLOAD ---
-                if fpath in self.local_files:
-                    local_full = os.path.join(self.local_dir, fpath)
-                    # Derive deterministic blob name when key is loaded
-                    blob_name = self.encrypt_filename(fpath) if self.encryption_key else fpath
-                    blob = self.bucket.blob(blob_name)
+                    transfer_history.append((now, chunk_size, is_upload))
+                    cutoff = now - 2.0
+                    transfer_history = [item for item in transfer_history if item[0] >= cutoff]
 
-                    if self.encryption_key:
-                        self.status_var.set(f"Encrypting & Uploading ({i+1}/{total}): {fpath}")
-                        try:
+                    up_window = sum(item[1] for item in transfer_history if item[2])
+                    down_window = sum(item[1] for item in transfer_history if not item[2])
+                    window_duration = max(0.2, now - transfer_history[0][0]) if transfer_history else 1.0
+
+                    inst_up_speed = up_window / window_duration
+                    inst_down_speed = down_window / window_duration
+
+                    elapsed = max(0.1, now - sync_start_time)
+                    overall_avg_speed = transferred_bytes / elapsed
+                    remaining_bytes = max(0, total_bytes - transferred_bytes)
+
+                    active_speed = (inst_up_speed + inst_down_speed) if (inst_up_speed + inst_down_speed) > 0 else overall_avg_speed
+                    eta_seconds = (remaining_bytes / active_speed) if active_speed > 0 else 0
+
+                    pct = min(100, int((transferred_bytes / total_bytes) * 100)) if total_bytes > 0 else 100
+                    self.progress['value'] = pct
+
+                    if hasattr(self, 'speed_var'):
+                        self.speed_var.set(f"Speed: ↑ {format_transfer_speed(inst_up_speed)}  |  ↓ {format_transfer_speed(inst_down_speed)}")
+                    if hasattr(self, 'time_var'):
+                        self.time_var.set(f"Time: Elapsed: {format_time_duration(elapsed)}  |  ETA: {format_time_duration(eta_seconds)}")
+                    if hasattr(self, 'volume_var'):
+                        self.volume_var.set(f"Volume: {self.format_size(transferred_bytes)} / {self.format_size(total_bytes)} ({pct}%)")
+                    self.master.update_idletasks()
+
+            def transfer_single_file(fpath: str):
+                """Worker function executed inside ThreadPoolExecutor to transfer one file."""
+                nonlocal cache_updated, transferred_bytes, transfer_history
+                temp_download_path = None
+                file_start_bytes = 0
+
+                with state_lock:
+                    active_inflight_files.add(fpath)
+                    self.active_workers_count = len(active_inflight_files)
+                    self.current_syncing_file = next(iter(active_inflight_files), fpath)
+                    cur_active_list = list(active_inflight_files)
+
+                # Update live status bar with active workers summary
+                workers_summary = f"{len(cur_active_list)} active in parallel" if len(cur_active_list) > 1 else cur_active_list[0]
+                self.master.after(0, lambda: self.status_var.set(
+                    f"Syncing [{completed_count + 1}/{total}] ({workers_summary}): {fpath}"
+                ))
+
+                try:
+                    check_interrupted()
+
+                    # --- UPLOAD ---
+                    if fpath in self.local_files:
+                        local_full = os.path.join(self.local_dir, fpath)
+                        blob_name = self.encrypt_filename(fpath) if self.encryption_key else fpath
+                        blob = self.bucket.blob(blob_name)
+
+                        if self.encryption_key:
                             file_size = os.path.getsize(local_full)
                             with open(local_full, 'rb') as f:
-                                enc_stream = EncryptedStreamAdapter(f, self.encryption_key)
+                                enc_stream = EncryptedStreamAdapter(
+                                    f, 
+                                    self.encryption_key, 
+                                    on_progress=lambda n: on_chunk_transferred(n, is_upload=True),
+                                    check_interrupted=check_interrupted
+                                )
                                 blob.metadata = {
                                     'encryption': 'aes-stream',
                                     'encrypted_path': self.encrypt_metadata_path(fpath)
                                 }
-                                # Size is original + 16 bytes for CTR nonce
                                 blob.upload_from_file(enc_stream, size=file_size + 16)
-                        except Exception as e:
-                            print(f"Upload error {fpath}: {e}")
-                            continue
-                    else:
-                        self.status_var.set(f"Uploading Unencrypted ({i+1}/{total}): {fpath}")
-                        blob.upload_from_filename(local_full)
+                        else:
+                            file_size = os.path.getsize(local_full)
+                            with open(local_full, 'rb') as f:
+                                prog_stream = ProgressStreamAdapter(
+                                    f, 
+                                    on_progress=lambda n: on_chunk_transferred(n, is_upload=True),
+                                    check_interrupted=check_interrupted
+                                )
+                                blob.upload_from_file(prog_stream, size=file_size)
 
-                    blob.reload()
-                    is_enc = blob.metadata and blob.metadata.get('encryption') == 'aes-stream'
-                    self.cloud_files[fpath] = {
-                        'size': blob.size,
-                        'modified': blob.updated,
-                        'is_encrypted': is_enc,
-                        'blob_name': blob.name
-                    }
-                    cache_updated = True
+                        blob.reload()
+                        is_enc = blob.metadata and blob.metadata.get('encryption') == 'aes-stream'
+                        with state_lock:
+                            self.cloud_files[fpath] = {
+                                'size': blob.size,
+                                'modified': blob.updated,
+                                'is_encrypted': is_enc,
+                                'blob_name': blob.name
+                            }
+                            cache_updated = True
 
-                # --- DOWNLOAD ---
-                elif fpath in self.cloud_files and self.sync_mode != "local_to_cloud":
-                    self.status_var.set(f"Downloading ({i+1}/{total}): {fpath}")
-                    local_full = os.path.join(self.local_dir, fpath)
-                    os.makedirs(os.path.dirname(local_full), exist_ok=True)
+                    # --- DOWNLOAD ---
+                    elif fpath in self.cloud_files and self.sync_mode != "local_to_cloud":
+                        local_full = os.path.join(self.local_dir, fpath)
+                        os.makedirs(os.path.dirname(local_full), exist_ok=True)
+                        temp_download_path = local_full + f".part.{os.getpid()}_{threading.get_ident()}"
 
-                    blob_name = self.cloud_files[fpath].get('blob_name', fpath)
-                    blob = self.bucket.get_blob(blob_name)
-                    if not blob:
-                        print(f"Cloud blob not found: {blob_name}")
-                        continue
+                        with state_lock:
+                            blob_name = self.cloud_files[fpath].get('blob_name', fpath)
+                        blob = self.bucket.get_blob(blob_name)
+                        if not blob:
+                            print(f"Cloud blob not found: {blob_name}")
+                            return False
 
-                    is_enc = blob.metadata and blob.metadata.get('encryption') == 'aes-stream'
+                        is_enc = blob.metadata and blob.metadata.get('encryption') == 'aes-stream'
 
-                    if is_enc:
-                        if not self.encryption_key:
-                            print(f"Skipping {fpath}: Blob is encrypted but no key loaded.")
-                            continue
+                        if is_enc:
+                            if not self.encryption_key:
+                                print(f"Skipping {fpath}: Blob is encrypted but no key loaded.")
+                                return False
 
-                        self.status_var.set(f"Decrypting & Streaming ({i+1}/{total}): {fpath}")
-
-                        try:
                             with blob.open("rb") as gcs_stream:
+                                check_interrupted()
                                 nonce = gcs_stream.read(16)
+                                on_chunk_transferred(len(nonce), is_upload=False)
                                 if len(nonce) < 16:
                                     print(f"Corrupted file header for: {fpath}")
-                                    continue
+                                    return False
 
                                 cipher = Cipher(algorithms.AES(self.encryption_key), modes.CTR(nonce), backend=default_backend())
                                 decryptor = cipher.decryptor()
 
-                                with open(local_full, 'wb') as dest_file:
+                                with open(temp_download_path, 'wb') as dest_file:
                                     while True:
+                                        check_interrupted()
                                         chunk = gcs_stream.read(64 * 1024)
                                         if not chunk:
                                             break
                                         dest_file.write(decryptor.update(chunk))
+                                        on_chunk_transferred(len(chunk), is_upload=False)
                                     dest_file.write(decryptor.finalize())
-                        except Exception as e:
-                            print(f"Decryption error {fpath}: {e}")
-                            continue
-                    else:
-                        blob.download_to_filename(local_full)
+                        else:
+                            with blob.open("rb") as gcs_stream:
+                                with open(temp_download_path, 'wb') as dest_file:
+                                    while True:
+                                        check_interrupted()
+                                        chunk = gcs_stream.read(64 * 1024)
+                                        if not chunk:
+                                            break
+                                        dest_file.write(chunk)
+                                        on_chunk_transferred(len(chunk), is_upload=False)
 
-                    st = os.stat(local_full)
-                    self.local_files[fpath] = {
-                        'path': local_full,
-                        'size': st.st_size,
-                        'modified': datetime.datetime.fromtimestamp(st.st_mtime)
-                    }
+                        if os.path.exists(temp_download_path):
+                            if os.path.exists(local_full):
+                                os.remove(local_full)
+                            os.rename(temp_download_path, local_full)
+                        temp_download_path = None
+
+                        st = os.stat(local_full)
+                        with state_lock:
+                            self.local_files[fpath] = {
+                                'path': local_full,
+                                'size': st.st_size,
+                                'modified': datetime.datetime.fromtimestamp(st.st_mtime)
+                            }
+
+                    return True
+
+                except (SyncPausedException, SyncCancelledException):
+                    if temp_download_path and os.path.exists(temp_download_path):
+                        try:
+                            os.remove(temp_download_path)
+                        except Exception:
+                            pass
+                    raise
+
+                except Exception as e:
+                    print(f"Transfer error {fpath}: {e}")
+                    if temp_download_path and os.path.exists(temp_download_path):
+                        try:
+                            os.remove(temp_download_path)
+                        except Exception:
+                            pass
+                    return False
+
+                finally:
+                    with state_lock:
+                        active_inflight_files.discard(fpath)
+                        self.active_workers_count = len(active_inflight_files)
+                        self.current_syncing_file = next(iter(active_inflight_files), None)
+
+            # Concurrent transfer loop across ThreadPoolExecutor
+            num_workers = max(1, min(16, getattr(self, 'max_workers', 4)))
+            pending_queue = list(file_list)
+
+            while pending_queue and not self.is_cancelled:
+                # Wait if paused before dispatching next batch of workers
+                if self.is_paused:
+                    self.master.after(0, lambda: self.status_var.set("⏸️ Sync Paused. Click 'Resume Sync' to continue."))
+                    if hasattr(self, 'speed_var'):
+                        self.speed_var.set("Speed: ⏸️ PAUSED (0.0 KB/s)")
+                    self.pause_event.wait()
+                    if self.is_cancelled:
+                        break
+
+                current_batch = []
+                # Pop next batch of tasks up to worker pool capacity
+                batch_size = min(len(pending_queue), num_workers)
+                for _ in range(batch_size):
+                    if pending_queue:
+                        current_batch.append(pending_queue.pop(0))
+
+                with ThreadPoolExecutor(max_workers=len(current_batch), thread_name_prefix="GcsSyncWorker") as executor:
+                    future_to_file = {executor.submit(transfer_single_file, f): f for f in current_batch}
+
+                    for future in as_completed(future_to_file):
+                        f = future_to_file[future]
+                        try:
+                            res = future.result()
+                            if res:
+                                completed_count += 1
+                        except SyncPausedException:
+                            # Re-queue interrupted file to re-sync from byte 0 when resumed
+                            pending_queue.insert(0, f)
+                            with progress_lock:
+                                transfer_history = []
+                            self.pause_event.wait()
+                            if self.is_cancelled:
+                                break
+                        except SyncCancelledException:
+                            break
+                        except Exception as exc:
+                            print(f"Worker exception for {f}: {exc}")
 
             # Update cache file if any changes were made
             if cache_updated:
                 self.save_cloud_cache()
 
-            self.progress['value'] = total
-            self.status_var.set(f"Sync Finished ({total} files processed). Cloud cache updated.")
-            self.master.after(0, lambda: [
-                self.update_file_list(),
-                messagebox.showinfo("Sync Finished", f"Processed {total} items successfully.")
-            ])
+            total_elapsed = max(0.1, time.time() - sync_start_time)
+            avg_speed = transferred_bytes / total_elapsed
+
+            if self.is_cancelled:
+                self.progress['value'] = 0
+                if hasattr(self, 'speed_var'):
+                    self.speed_var.set("Speed: 0.0 KB/s (Cancelled)")
+                self.status_var.set(f"⏹️ Sync Cancelled by user. {completed_count} of {total} files completed.")
+                self.master.after(0, lambda: [
+                    self.update_file_list(),
+                    messagebox.showinfo("Sync Cancelled", f"Sync was cancelled. {completed_count} of {total} files completed.")
+                ])
+            else:
+                self.progress['value'] = 100
+                if hasattr(self, 'speed_var'):
+                    self.speed_var.set(f"Speed: Avg {format_transfer_speed(avg_speed)} (↑ {self.format_size(upload_bytes)} / ↓ {self.format_size(download_bytes)})")
+                if hasattr(self, 'time_var'):
+                    self.time_var.set(f"Time: Elapsed: {format_time_duration(total_elapsed)}  |  ETA: 00:00")
+                if hasattr(self, 'volume_var'):
+                    self.volume_var.set(f"Volume: {self.format_size(transferred_bytes)} processed")
+
+                self.status_var.set(f"Sync Finished ({completed_count}/{total} files, {self.format_size(transferred_bytes)} in {format_time_duration(total_elapsed)} at {format_transfer_speed(avg_speed)} using {num_workers} parallel workers). Cloud cache updated.")
+                self.master.after(0, lambda: [
+                    self.update_file_list(),
+                    messagebox.showinfo("Sync Finished", f"Processed {completed_count} items successfully ({self.format_size(transferred_bytes)} in {format_time_duration(total_elapsed)} with {num_workers} parallel workers).")
+                ])
 
         except Exception as e:
             self.master.after(0, lambda err=e: messagebox.showerror("Sync Error", f"Sync failed:\n{err}"))
         finally:
+            self.is_syncing = False
+            self.is_paused = False
+            self.is_cancelled = False
+            self.current_syncing_file = None
+            self.active_workers_count = 0
             self.progress['value'] = 0
+            self.master.after(0, lambda: [
+                self.pause_button.config(state=tk.DISABLED, text="⏸️ Pause Sync"),
+                self.cancel_button.config(state=tk.DISABLED),
+                self.sync_button.config(state=tk.NORMAL),
+                self.sync_all_button.config(state=tk.NORMAL),
+                self.scan_button.config(state=tk.NORMAL)
+            ])
 
 
 def main():
